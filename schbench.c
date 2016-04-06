@@ -39,6 +39,8 @@ static int sleeptime = 30000;
 static unsigned long long cputime = 30000;
 /* -a, bool */
 static int autobench = 0;
+/* -p bool */
+static int pipe_test = 0;
 
 /* the latency histogram uses this to pitch outliers */
 static unsigned int max_us = 50000;
@@ -72,9 +74,10 @@ enum {
 	HELP_LONG_OPT = 1,
 };
 
-char *option_string = "am:t:s:c:r:";
+char *option_string = "pam:t:s:c:r:";
 static struct option long_options[] = {
 	{"auto", no_argument, 0, 'a'},
+	{"pipe", no_argument, 0, 'p'},
 	{"message-threads", required_argument, 0, 'm'},
 	{"threads", required_argument, 0, 't'},
 	{"runtime", required_argument, 0, 'r'},
@@ -87,11 +90,13 @@ static struct option long_options[] = {
 static void print_usage(void)
 {
 	fprintf(stderr, "schbench usage:\n"
-		"\t-d (--dispatch-threads): number of message threads (def: 2)\n"
+		"\t-m (--message-threads): number of message threads (def: 2)\n"
 		"\t-t (--threads): worker threads per message thread (def: 16)\n"
 		"\t-r (--runtime): How long to run before exiting (seconds, def: 30)\n"
 		"\t-s (--sleeptime): Message thread latency (usec, def: 10000\n"
 		"\t-c (--cputime): How long to think during loop (usec, def: 10000\n"
+		"\t-a (--auto): grow thread count until latencies hurt (def: off)\n"
+		"\t-p (--pipe): simulate a pipe test (def: off)\n"
 	       );
 	exit(1);
 }
@@ -113,13 +118,16 @@ static void parse_options(int ac, char **av)
 		case 'a':
 			autobench = 1;
 			break;
+		case 'p':
+			pipe_test = 1;
+			break;
 		case 's':
 			sleeptime = atoi(optarg);
 			break;
 		case 'c':
 			cputime = atoi(optarg);
 			break;
-		case 'd':
+		case 'm':
 			message_threads = atoi(optarg);
 			break;
 		case 't':
@@ -376,6 +384,8 @@ struct thread_data {
 
 	/* mr axboe's magic latency histogram */
 	struct stats stats;
+	double loops_per_sec;
+	char pipe_page[4096];
 };
 
 /* we're so fancy we make our own futex wrappers */
@@ -398,7 +408,7 @@ static void fpost(int *futexp)
 
 	if (__sync_bool_compare_and_swap(futexp, FUTEX_BLOCKED,
 					 FUTEX_RUNNING)) {
-		s = futex(futexp, FUTEX_WAKE, 1, NULL, NULL, 0);
+		s = futex(futexp, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
 		if (s  == -1) {
 			perror("FUTEX_WAKE");
 			exit(1);
@@ -423,7 +433,7 @@ static int fwait(int *futexp, struct timespec *timeout)
 			break;      /* Yes */
 		}
 		/* Futex is not available; wait */
-		s = futex(futexp, FUTEX_WAIT, FUTEX_BLOCKED, timeout, NULL, 0);
+		s = futex(futexp, FUTEX_WAIT_PRIVATE, FUTEX_BLOCKED, timeout, NULL, 0);
 		if (s == -1 && errno != EAGAIN) {
 			if (errno == ETIMEDOUT)
 				return -ETIMEDOUT;
@@ -489,7 +499,12 @@ static void xlist_wake_all(struct thread_data *td)
 	while (list) {
 		next = list->next;
 		list->next = NULL;
-		memcpy(&list->wake_time, &now, sizeof(now));
+		if (pipe_test) {
+			memset(list->pipe_page, 1, 4096);
+			gettimeofday(&list->wake_time, NULL);
+		} else {
+			memcpy(&list->wake_time, &now, sizeof(now));
+		}
 		fpost(&list->futex);
 		list = next;
 	}
@@ -509,6 +524,8 @@ static void msg_and_wait(struct thread_data *td)
 
 	timeout.tv_sec = 0;
 	timeout.tv_nsec = 5000 * 1000;
+
+	memset(td->pipe_page, 2, 4096);
 
 	/* set ourselves to blocked */
 	td->futex = FUTEX_BLOCKED;
@@ -550,9 +567,14 @@ static void run_msg_thread(struct thread_data *td)
 	int max_jitter = sleeptime / 4;
 	int jitter;
 
-	jitter = rand_r(&seed) % max_jitter;
-	timeout.tv_sec = 0;
-	timeout.tv_nsec = (sleeptime + jitter) * 1000;
+	if (!pipe_test) {
+		jitter = rand_r(&seed) % max_jitter;
+		timeout.tv_sec = 0;
+		timeout.tv_nsec = (sleeptime + jitter) * 1000;
+	} else {
+		timeout.tv_sec = 1;
+		timeout.tv_nsec = 0;
+	}
 
 	while (1) {
 		td->futex = FUTEX_BLOCKED;
@@ -571,8 +593,10 @@ static void run_msg_thread(struct thread_data *td)
 		 * messages shouldn't be instant, sleep a little to make them
 		 * wait
 		 */
-		jitter = rand_r(&seed) % max_jitter;
-		usleep(sleeptime + jitter);
+		if (!pipe_test) {
+			jitter = rand_r(&seed) % max_jitter;
+			usleep(sleeptime + jitter);
+		}
 	}
 }
 
@@ -583,6 +607,9 @@ static void usec_spin(unsigned long spin_time)
 	struct timeval now;
 	struct timeval start;
 	unsigned long long delta;
+
+	if (spin_time == 0)
+		return;
 
 	gettimeofday(&start, NULL);
 	while (1) {
@@ -601,14 +628,26 @@ static void usec_spin(unsigned long spin_time)
 void *worker_thread(void *arg)
 {
 	struct thread_data *td = arg;
+	struct timeval now;
+	struct timeval start;
+	unsigned long long delta;
+	unsigned long loop_count = 0;
+	double seconds;
 
+	gettimeofday(&start, NULL);
 	while(1) {
 		if (stopping)
 			break;
 
 		usec_spin(cputime);
 		msg_and_wait(td);
+		loop_count++;
 	}
+	gettimeofday(&now, NULL);
+	delta = tvdelta(&start, &now);
+
+	seconds = (double)delta/1000000;
+	td->loops_per_sec = (double)loop_count / seconds;
 	return NULL;
 }
 
@@ -649,9 +688,11 @@ void *message_thread(void *arg)
 	for (i = 0; i < worker_threads; i++) {
 		pthread_join(worker_threads_mem[i].tid, NULL);
 		combine_stats(&td->stats, &worker_threads_mem[i].stats);
+		td->loops_per_sec += worker_threads_mem[i].loops_per_sec;
 	}
 	free(worker_threads_mem);
 
+	td->loops_per_sec /= worker_threads;
 	return NULL;
 }
 
@@ -661,6 +702,7 @@ int main(int ac, char **av)
 	int ret;
 	struct thread_data *message_threads_mem = NULL;
 	struct stats stats;
+	double loops_per_sec = 0;
 
 	parse_options(ac, av);
 again:
@@ -692,6 +734,7 @@ again:
 	for (i = 0; i < message_threads; i++) {
 		pthread_join(message_threads_mem[i].tid, NULL);
 		combine_stats(&stats, &message_threads_mem[i].stats);
+		loops_per_sec += message_threads_mem[i].loops_per_sec;
 	}
 
 	free(message_threads_mem);
@@ -711,6 +754,9 @@ again:
 	}
 
 	show_latencies(&stats);
+	if (pipe_test)
+		printf("avg loops per second: %.4f\n",
+		       loops_per_sec / message_threads);
 
 	return 0;
 }
