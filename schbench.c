@@ -1,3 +1,13 @@
+/*
+ * schbench.c
+ *
+ * Copyright (C) 2016 Facebook
+ * Chris Mason <clm@fb.com>
+ *
+ * GPLv2, portions copied from the kernel and from Jens Axboe's fio
+ *
+ * gcc -Wall -O0 -W schbench.c -o schbench -lpthread
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -24,9 +34,9 @@ static int worker_threads = 16;
 /* -r  seconds */
 static int runtime = 30;
 /* -s  usec */
-static int sleeptime = 10000;
+static int sleeptime = 30000;
 /* -c  usec */
-static unsigned long long cputime = 10000;
+static unsigned long long cputime = 30000;
 /* -a, bool */
 static int autobench = 0;
 
