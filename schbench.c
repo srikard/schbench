@@ -28,7 +28,7 @@
 #define PLAT_LIST_MAX	20
 
 /* when -p is on, how much do we send back and forth */
-#define PIPE_TRANSFER_SIZE 4096
+#define PIPE_TRANSFER_BUFFER (1 * 1024 * 1024)
 
 /* -m number of message threads */
 static int message_threads = 2;
@@ -42,7 +42,7 @@ static int sleeptime = 30000;
 static unsigned long long cputime = 30000;
 /* -a, bool */
 static int autobench = 0;
-/* -p bool */
+/* -p bytes */
 static int pipe_test = 0;
 
 /* the latency histogram uses this to pitch outliers */
@@ -74,10 +74,10 @@ enum {
 	HELP_LONG_OPT = 1,
 };
 
-char *option_string = "pam:t:s:c:r:";
+char *option_string = "p:am:t:s:c:r:";
 static struct option long_options[] = {
 	{"auto", no_argument, 0, 'a'},
-	{"pipe", no_argument, 0, 'p'},
+	{"pipe", required_argument, 0, 'p'},
 	{"message-threads", required_argument, 0, 'm'},
 	{"threads", required_argument, 0, 't'},
 	{"runtime", required_argument, 0, 'r'},
@@ -96,7 +96,7 @@ static void print_usage(void)
 		"\t-s (--sleeptime): Message thread latency (usec, def: 10000\n"
 		"\t-c (--cputime): How long to think during loop (usec, def: 10000\n"
 		"\t-a (--auto): grow thread count until latencies hurt (def: off)\n"
-		"\t-p (--pipe): simulate a pipe test (def: off)\n"
+		"\t-p (--pipe): transfer size bytes to simulate a pipe test (def: 0)\n"
 	       );
 	exit(1);
 }
@@ -119,7 +119,12 @@ static void parse_options(int ac, char **av)
 			autobench = 1;
 			break;
 		case 'p':
-			pipe_test = 1;
+			pipe_test = atoi(optarg);
+			if (pipe_test > PIPE_TRANSFER_BUFFER) {
+				fprintf(stderr, "pipe size too big, using %d\n",
+					PIPE_TRANSFER_BUFFER);
+				pipe_test = PIPE_TRANSFER_BUFFER;
+			}
 			break;
 		case 's':
 			sleeptime = atoi(optarg);
@@ -385,7 +390,7 @@ struct thread_data {
 	/* mr axboe's magic latency histogram */
 	struct stats stats;
 	double loops_per_sec;
-	char pipe_page[PIPE_TRANSFER_SIZE];
+	char pipe_page[PIPE_TRANSFER_BUFFER];
 };
 
 /* we're so fancy we make our own futex wrappers */
@@ -503,7 +508,7 @@ static void xlist_wake_all(struct thread_data *td)
 		next = list->next;
 		list->next = NULL;
 		if (pipe_test) {
-			memset(list->pipe_page, 1, PIPE_TRANSFER_SIZE);
+			memset(list->pipe_page, 1, pipe_test);
 			gettimeofday(&list->wake_time, NULL);
 		} else {
 			memcpy(&list->wake_time, &now, sizeof(now));
@@ -528,7 +533,8 @@ static void msg_and_wait(struct thread_data *td)
 	timeout.tv_sec = 0;
 	timeout.tv_nsec = 5000 * 1000;
 
-	memset(td->pipe_page, 2, PIPE_TRANSFER_SIZE);
+	if (pipe_test)
+		memset(td->pipe_page, 2, pipe_test);
 
 	/* set ourselves to blocked */
 	td->futex = FUTEX_BLOCKED;
@@ -681,6 +687,7 @@ void *message_thread(void *arg)
 	run_msg_thread(td);
 
 	for (i = 0; i < worker_threads; i++) {
+		fpost(&worker_threads_mem[i].futex);
 		pthread_join(worker_threads_mem[i].tid, NULL);
 		combine_stats(&td->stats, &worker_threads_mem[i].stats);
 		td->loops_per_sec += worker_threads_mem[i].loops_per_sec;
@@ -767,6 +774,7 @@ again:
 	sleep_for_runtime();
 
 	for (i = 0; i < message_threads; i++) {
+		fpost(&message_threads_mem[i].futex);
 		pthread_join(message_threads_mem[i].tid, NULL);
 		combine_stats(&stats, &message_threads_mem[i].stats);
 		loops_per_sec += message_threads_mem[i].loops_per_sec;
@@ -791,10 +799,12 @@ again:
 	show_latencies(&stats);
 	if (pipe_test) {
 		char *pretty;
+		double mb_per_sec;
 		loops_per_sec /= message_threads;
-		loops_per_sec *= PIPE_TRANSFER_SIZE;
-		loops_per_sec = pretty_size(loops_per_sec, &pretty);
-		printf("avg worker transfer: %.2f%s/s\n", loops_per_sec, pretty);
+		mb_per_sec = loops_per_sec * pipe_test;
+		mb_per_sec = pretty_size(mb_per_sec, &pretty);
+		printf("avg worker transfer: %.2f ops/sec %.2f%s/s\n",
+		       loops_per_sec, mb_per_sec, pretty);
 
 	}
 
