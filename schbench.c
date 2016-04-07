@@ -104,6 +104,8 @@ static void print_usage(void)
 static void parse_options(int ac, char **av)
 {
 	int c;
+	int found_sleeptime = -1;
+	int found_cputime = -1;
 
 	while (1) {
 		int option_index = 0;
@@ -125,12 +127,14 @@ static void parse_options(int ac, char **av)
 					PIPE_TRANSFER_BUFFER);
 				pipe_test = PIPE_TRANSFER_BUFFER;
 			}
+			sleeptime = 0;
+			cputime = 0;
 			break;
 		case 's':
-			sleeptime = atoi(optarg);
+			found_sleeptime = atoi(optarg);
 			break;
 		case 'c':
-			cputime = atoi(optarg);
+			found_cputime = atoi(optarg);
 			break;
 		case 'm':
 			message_threads = atoi(optarg);
@@ -149,6 +153,15 @@ static void parse_options(int ac, char **av)
 			break;
 		}
 	}
+
+	/*
+	 * by default pipe mode zeros out cputime and sleep time.  This
+	 * sets them to any args that were actually passed in
+	 */
+	if (found_sleeptime >= 0)
+		sleeptime = found_sleeptime;
+	if (found_cputime >= 0)
+		cputime = found_cputime;
 
 	if (optind < ac) {
 		fprintf(stderr, "Error Extra arguments '%s'\n", av[optind]);
@@ -755,7 +768,7 @@ again:
 
 
 	if (!message_threads_mem) {
-		perror("unable to allocate ram");
+		perror("unable to allocate message threads");
 		exit(1);
 	}
 
