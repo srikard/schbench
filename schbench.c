@@ -48,9 +48,6 @@ static int pipe_test = 0;
 /* the latency histogram uses this to pitch outliers */
 static unsigned int max_us = 50000;
 
-/* main() sets this to the time when we should all stop doing work */
-static struct timeval global_stop;
-
 /* the message threads flip this to true when they decide runtime is up */
 static unsigned long stopping = 0;
 
@@ -567,33 +564,25 @@ static void msg_and_wait(struct thread_data *td)
  */
 static void run_msg_thread(struct thread_data *td)
 {
-	struct timeval now;
-	struct timespec timeout;
 	unsigned int seed = pthread_self();
 	int max_jitter = sleeptime / 4;
 	int jitter = 0;
-
-	if (pipe_test || !sleeptime) {
-		timeout.tv_sec = 1;
-		timeout.tv_nsec = 0;
-	} else {
-		jitter = rand_r(&seed) % max_jitter;
-		timeout.tv_sec = 0;
-		timeout.tv_nsec = (sleeptime + jitter) * 1000;
-	}
 
 	while (1) {
 		td->futex = FUTEX_BLOCKED;
 		xlist_wake_all(td);
 
-		gettimeofday(&now, NULL);
-		if (now.tv_sec > global_stop.tv_sec) {
-			stopping = 1;
+		if (stopping) {
+			/*
+			 * add a barrier to make sure everyone has seen
+			 * stopping.  xlist_wake_all does barrier,
+			 * but it doesn't loop
+			 */
 			__sync_synchronize();
 			xlist_wake_all(td);
 			break;
 		}
-		fwait(&td->futex, &timeout);
+		fwait(&td->futex, NULL);
 
 		/*
 		 * messages shouldn't be instant, sleep a little to make them
@@ -718,6 +707,29 @@ static double pretty_size(double number, char **str)
 	return number;
 }
 
+/* runtime from the command line is in seconds.  Sleep until its up */
+static void sleep_for_runtime()
+{
+	struct timeval now;
+	struct timeval start;
+	unsigned long long delta;
+	unsigned long long runtime_usec = runtime * 1000000;
+
+	gettimeofday(&start, NULL);
+	sleep(runtime);
+
+	while(1) {
+		gettimeofday(&now, NULL);
+		delta = tvdelta(&start, &now);
+		if (delta < runtime_usec)
+			sleep(1);
+		else
+			break;
+	}
+	stopping = 1;
+	__sync_synchronize();
+}
+
 int main(int ac, char **av)
 {
 	int i;
@@ -739,8 +751,6 @@ again:
 		perror("unable to allocate ram");
 		exit(1);
 	}
-	gettimeofday(&global_stop, NULL);
-	global_stop.tv_sec += runtime;
 
 	/* start our message threads, each one starts its own workers */
 	for (i = 0; i < message_threads; i++) {
@@ -753,6 +763,9 @@ again:
 		}
 		message_threads_mem[i].tid = tid;
 	}
+
+	sleep_for_runtime();
+
 	for (i = 0; i < message_threads; i++) {
 		pthread_join(message_threads_mem[i].tid, NULL);
 		combine_stats(&stats, &message_threads_mem[i].stats);
