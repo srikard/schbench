@@ -27,6 +27,9 @@
 #define PLAT_NR		(PLAT_GROUP_NR * PLAT_VAL)
 #define PLAT_LIST_MAX	20
 
+/* when -p is on, how much do we send back and forth */
+#define PIPE_TRANSFER_SIZE 4096
+
 /* -m number of message threads */
 static int message_threads = 2;
 /* -t  number of workers per message thread */
@@ -385,7 +388,7 @@ struct thread_data {
 	/* mr axboe's magic latency histogram */
 	struct stats stats;
 	double loops_per_sec;
-	char pipe_page[4096];
+	char pipe_page[PIPE_TRANSFER_SIZE];
 };
 
 /* we're so fancy we make our own futex wrappers */
@@ -487,6 +490,9 @@ static struct thread_data *xlist_splice(struct thread_data *head)
  * the list run.  We want to detect when the scheduler is just preempting the
  * waker and giving away the rest of its timeslice.  So we gtod once at
  * the start of the loop and use that for all the threads we wake.
+ *
+ * Since pipe mode ends up measuring this other ways, we do the gtod
+ * every time in pipe mode
  */
 static void xlist_wake_all(struct thread_data *td)
 {
@@ -500,7 +506,7 @@ static void xlist_wake_all(struct thread_data *td)
 		next = list->next;
 		list->next = NULL;
 		if (pipe_test) {
-			memset(list->pipe_page, 1, 4096);
+			memset(list->pipe_page, 1, PIPE_TRANSFER_SIZE);
 			gettimeofday(&list->wake_time, NULL);
 		} else {
 			memcpy(&list->wake_time, &now, sizeof(now));
@@ -525,7 +531,7 @@ static void msg_and_wait(struct thread_data *td)
 	timeout.tv_sec = 0;
 	timeout.tv_nsec = 5000 * 1000;
 
-	memset(td->pipe_page, 2, 4096);
+	memset(td->pipe_page, 2, PIPE_TRANSFER_SIZE);
 
 	/* set ourselves to blocked */
 	td->futex = FUTEX_BLOCKED;
@@ -565,15 +571,15 @@ static void run_msg_thread(struct thread_data *td)
 	struct timespec timeout;
 	unsigned int seed = pthread_self();
 	int max_jitter = sleeptime / 4;
-	int jitter;
+	int jitter = 0;
 
-	if (!pipe_test) {
+	if (pipe_test || !sleeptime) {
+		timeout.tv_sec = 1;
+		timeout.tv_nsec = 0;
+	} else {
 		jitter = rand_r(&seed) % max_jitter;
 		timeout.tv_sec = 0;
 		timeout.tv_nsec = (sleeptime + jitter) * 1000;
-	} else {
-		timeout.tv_sec = 1;
-		timeout.tv_nsec = 0;
 	}
 
 	while (1) {
@@ -593,7 +599,7 @@ static void run_msg_thread(struct thread_data *td)
 		 * messages shouldn't be instant, sleep a little to make them
 		 * wait
 		 */
-		if (!pipe_test) {
+		if (!pipe_test && sleeptime) {
 			jitter = rand_r(&seed) % max_jitter;
 			usleep(sleeptime + jitter);
 		}
@@ -696,6 +702,22 @@ void *message_thread(void *arg)
 	return NULL;
 }
 
+static char *units[] = { "B", "KB", "MB", "GB", "TB", "PB", "EB", NULL};
+
+static double pretty_size(double number, char **str)
+{
+	int divs = 0;
+
+	while(number >= 1024) {
+		if (units[divs + 1] == NULL)
+			break;
+		divs++;
+		number /= 1024;
+	}
+	*str = units[divs];
+	return number;
+}
+
 int main(int ac, char **av)
 {
 	int i;
@@ -754,9 +776,14 @@ again:
 	}
 
 	show_latencies(&stats);
-	if (pipe_test)
-		printf("avg loops per second: %.4f\n",
-		       loops_per_sec / message_threads);
+	if (pipe_test) {
+		char *pretty;
+		loops_per_sec /= message_threads;
+		loops_per_sec *= PIPE_TRANSFER_SIZE;
+		loops_per_sec = pretty_size(loops_per_sec, &pretty);
+		printf("avg worker transfer: %.2f%s/s\n", loops_per_sec, pretty);
+
+	}
 
 	return 0;
 }
