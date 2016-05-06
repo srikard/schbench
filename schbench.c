@@ -45,9 +45,6 @@ static int autobench = 0;
 /* -p bytes */
 static int pipe_test = 0;
 
-/* the latency histogram uses this to pitch outliers */
-static unsigned int max_us = 50000;
-
 /* the message threads flip this to true when they decide runtime is up */
 static volatile unsigned long stopping = 0;
 
@@ -63,7 +60,6 @@ struct stats {
 	unsigned int nr_samples;
 	unsigned int max;
 	unsigned int min;
-	unsigned int over;
 };
 
 /* this defines which latency profiles get printed */
@@ -342,7 +338,7 @@ static void show_latencies(struct stats *s)
 	if (ovals)
 		free(ovals);
 
-	fprintf(stderr, "\tOver=%u, min=%u, max=%u\n", s->over, s->min, s->max);
+	fprintf(stderr, "\tmin=%u, max=%u\n", s->min, s->max);
 }
 
 /* fold latency info from s into d */
@@ -352,7 +348,6 @@ void combine_stats(struct stats *d, struct stats *s)
 	for (i = 0; i < PLAT_NR; i++)
 		d->plat[i] += s->plat[i];
 	d->nr_samples += s->nr_samples;
-	d->over += s->over;
 	if (s->max > d->max)
 		d->max = s->max;
 	if (s->min < d->min)
@@ -368,11 +363,6 @@ static void add_lat(struct stats *s, unsigned int us)
 		s->max = us;
 	if (us < s->min)
 		s->min = us;
-
-	if (us > max_us) {
-		fprintf(stderr, "latency=%u usec\n", us);
-		s->over++;
-	}
 
 	lat_index = plat_val_to_idx(us);
 	__sync_fetch_and_add(&s->plat[lat_index], 1);
@@ -541,10 +531,6 @@ static void msg_and_wait(struct thread_data *td)
 {
 	struct timeval now;
 	unsigned long long delta;
-	struct timespec timeout;
-
-	timeout.tv_sec = 0;
-	timeout.tv_nsec = 5000 * 1000;
 
 	if (pipe_test)
 		memset(td->pipe_page, 2, pipe_test);
