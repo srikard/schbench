@@ -49,7 +49,7 @@ static int pipe_test = 0;
 static unsigned int max_us = 50000;
 
 /* the message threads flip this to true when they decide runtime is up */
-static unsigned long stopping = 0;
+static volatile unsigned long stopping = 0;
 
 
 /*
@@ -746,8 +746,8 @@ static void sleep_for_runtime()
 		else
 			break;
 	}
-	stopping = 1;
 	__sync_synchronize();
+	stopping = 1;
 }
 
 int main(int ac, char **av)
