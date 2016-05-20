@@ -44,6 +44,8 @@ static unsigned long long cputime = 30000;
 static int autobench = 0;
 /* -p bytes */
 static int pipe_test = 0;
+/* -R requests per sec */
+static int requests_per_sec = 0;
 
 /* the message threads flip this to true when they decide runtime is up */
 static volatile unsigned long stopping = 0;
@@ -70,13 +72,14 @@ enum {
 	HELP_LONG_OPT = 1,
 };
 
-char *option_string = "p:am:t:s:c:r:";
+char *option_string = "p:am:t:s:c:r:R:";
 static struct option long_options[] = {
 	{"auto", no_argument, 0, 'a'},
 	{"pipe", required_argument, 0, 'p'},
 	{"message-threads", required_argument, 0, 'm'},
 	{"threads", required_argument, 0, 't'},
 	{"runtime", required_argument, 0, 'r'},
+	{"rps", required_argument, 0, 'R'},
 	{"sleeptime", required_argument, 0, 's'},
 	{"cputime", required_argument, 0, 'c'},
 	{"help", no_argument, 0, HELP_LONG_OPT},
@@ -93,6 +96,7 @@ static void print_usage(void)
 		"\t-c (--cputime): How long to think during loop (usec, def: 10000\n"
 		"\t-a (--auto): grow thread count until latencies hurt (def: off)\n"
 		"\t-p (--pipe): transfer size bytes to simulate a pipe test (def: 0)\n"
+		"\t-R (--rps): requests per second mode (count, def: 0)\n"
 	       );
 	exit(1);
 }
@@ -140,6 +144,9 @@ static void parse_options(int ac, char **av)
 			break;
 		case 'r':
 			runtime = atoi(optarg);
+			break;
+		case 'R':
+			requests_per_sec = atoi(optarg);
 			break;
 		case '?':
 		case HELP_LONG_OPT:
@@ -369,6 +376,11 @@ static void add_lat(struct stats *s, unsigned int us)
 	__sync_fetch_and_add(&s->nr_samples, 1);
 }
 
+struct request {
+	struct timeval start_time;
+	struct request *next;
+};
+
 /*
  * every thread has one of these, it comes out to about 19K thanks to the
  * giant stats struct
@@ -377,6 +389,9 @@ struct thread_data {
 	pthread_t tid;
 	/* ->next is for placing us on the msg_thread's list for waking */
 	struct thread_data *next;
+
+	/* ->request is all of our pending request */
+	struct request *request;
 
 	/* our parent thread and messaging partner */
 	struct thread_data *msg_thread;
@@ -393,6 +408,7 @@ struct thread_data {
 	/* mr axboe's magic latency histogram */
 	struct stats stats;
 	double loops_per_sec;
+
 	char pipe_page[PIPE_TRANSFER_BUFFER];
 };
 
@@ -488,6 +504,65 @@ static struct thread_data *xlist_splice(struct thread_data *head)
 }
 
 /*
+ * cmpxchg based list prepend
+ */
+static struct request *request_add(struct thread_data *head, struct request *add)
+{
+	struct request *old;
+	struct request *ret;
+
+	while (1) {
+		old = head->request;
+		add->next = old;
+		ret = __sync_val_compare_and_swap(&head->request, old, add);
+		if (ret == old)
+			return old;
+	}
+}
+
+/*
+ * xchg based list splicing.  This returns the entire list and
+ * replaces the head->request with NULL.  The list is reversed before
+ * returning
+ */
+static struct request *request_splice(struct thread_data *head)
+{
+	struct request *old;
+	struct request *ret;
+	struct request *reverse = NULL;
+
+	while (1) {
+		old = head->request;
+		ret = __sync_val_compare_and_swap(&head->request, old, NULL);
+		if (ret == old)
+			break;
+	}
+
+	while(ret) {
+		struct request *tmp = ret;
+		ret = ret->next;
+		tmp->next = reverse;
+		reverse = tmp;
+	}
+	return reverse;
+}
+
+static struct request *allocate_request(void)
+{
+	struct request *ret = malloc(sizeof(*ret));
+
+	if (!ret) {
+		perror("malloc");
+		exit(1);
+	}
+
+	gettimeofday(&ret->start_time, NULL);
+	ret->next = NULL;
+	return ret;
+}
+
+
+/*
  * Wake everyone currently waiting on the message list, filling in their
  * thread_data->wake_time with the current time.
  *
@@ -527,10 +602,11 @@ static void xlist_wake_all(struct thread_data *td)
  * it, but that's good enough.  We gtod after waking and use that to
  * record scheduler latency.
  */
-static void msg_and_wait(struct thread_data *td)
+static struct request *msg_and_wait(struct thread_data *td)
 {
 	struct timeval now;
 	unsigned long long delta;
+	struct request *req;
 
 	if (pipe_test)
 		memset(td->pipe_page, 2, pipe_test);
@@ -540,7 +616,15 @@ static void msg_and_wait(struct thread_data *td)
 	gettimeofday(&td->wake_time, NULL);
 
 	/* add us to the list */
-	xlist_add(td->msg_thread, td);
+	if (requests_per_sec) {
+		req = request_splice(td);
+		if (req) {
+			td->futex = FUTEX_RUNNING;
+			return req;
+		}
+	} else {
+		xlist_add(td->msg_thread, td);
+	}
 
 	fpost(&td->msg_thread->futex);
 
@@ -555,10 +639,13 @@ static void msg_and_wait(struct thread_data *td)
 		fwait(&td->futex, NULL);
 	}
 
-	gettimeofday(&now, NULL);
-	delta = tvdelta(&td->wake_time, &now);
-	if (delta > 0)
-		add_lat(&td->stats, delta);
+	if (!requests_per_sec) {
+		gettimeofday(&now, NULL);
+		delta = tvdelta(&td->wake_time, &now);
+		if (delta > 0)
+			add_lat(&td->stats, delta);
+	}
+	return NULL;
 }
 
 /*
@@ -578,12 +665,6 @@ static void run_msg_thread(struct thread_data *td)
 		xlist_wake_all(td);
 
 		if (stopping) {
-			/*
-			 * add a barrier to make sure everyone has seen
-			 * stopping.  xlist_wake_all does barrier,
-			 * but it doesn't loop
-			 */
-			__sync_synchronize();
 			xlist_wake_all(td);
 			break;
 		}
@@ -600,8 +681,69 @@ static void run_msg_thread(struct thread_data *td)
 	}
 }
 
-#define nop __asm__ __volatile__("rep;nop": : :"memory")
+/*
+ * once the message thread starts all his children, this is where he
+ * loops until our runtime is up.  Basically this sits around waiting
+ * for posting by the worker threads, replying to their messages after
+ * a delay of 'sleeptime' + some jitter.
+ */
+static void run_rps_thread(struct thread_data *worker_threads_mem)
+{
+	/* number to wake at a time */
+	int nr_to_wake = worker_threads * 2 / 3;
+	/* how many times we tried to wake up workers */
+	unsigned long total_wake_runs = 0;
+	/* list to record tasks waiting for work */
+	/* how many times do we need to batch wakeups per second */
+	int wakeups_required;
+	/* start and end of the thread run */
+	struct timeval start;
+	struct request *request;
 
+	/* how long do we sleep between wakeup batches */
+	unsigned long sleep_time;
+	/* total number of times we kicked a worker */
+	unsigned long total_wakes = 0;
+	int left;
+	int cur_tid = 0;
+	int i;
+
+	gettimeofday(&start, NULL);
+
+	wakeups_required = (requests_per_sec + nr_to_wake - 1) / nr_to_wake;
+	sleep_time = 1000000 / wakeups_required;
+
+	while (1) {
+		/* start with a sleep to give everyone the chance to get going */
+		usleep(sleep_time);
+
+		gettimeofday(&start, NULL);
+		left = nr_to_wake;
+
+		for (i = 0; i < nr_to_wake; i++) {
+			struct thread_data *worker;
+			struct request *old;
+
+			worker = worker_threads_mem + cur_tid % worker_threads;
+			cur_tid++;
+
+			request = allocate_request();
+			old = request_add(worker, request);
+			total_wakes++;
+			memcpy(&worker->wake_time, &start, sizeof(start));
+			fpost(&worker->futex);
+		}
+		total_wake_runs++;
+
+		if (stopping) {
+			for (i = 0; i < worker_threads; i++)
+				fpost(&worker_threads_mem[i].futex);
+			break;
+		}
+	}
+}
+
+#define nop __asm__ __volatile__("rep;nop": : :"memory")
 static void usec_spin(unsigned long spin_time)
 {
 	struct timeval now;
@@ -632,6 +774,7 @@ void *worker_thread(void *arg)
 	struct timeval start;
 	unsigned long long delta;
 	unsigned long loop_count = 0;
+	struct request *req = NULL;
 	double seconds;
 
 	gettimeofday(&start, NULL);
@@ -639,9 +782,30 @@ void *worker_thread(void *arg)
 		if (stopping)
 			break;
 
-		usec_spin(cputime);
-		msg_and_wait(td);
-		loop_count++;
+		if (requests_per_sec) {
+			while (req) {
+				struct request *tmp = req->next;
+
+				usec_spin(cputime);
+
+				gettimeofday(&now, NULL);
+				delta = tvdelta(&req->start_time, &now);
+				if (delta > cputime)
+					delta -= cputime;
+				else
+					delta = 1;
+				add_lat(&td->stats, delta);
+
+				free(req);
+				req = tmp;
+				loop_count++;
+			}
+		} else {
+			usec_spin(cputime);
+			loop_count++;
+		}
+
+		req = msg_and_wait(td);
 	}
 	gettimeofday(&now, NULL);
 	delta = tvdelta(&start, &now);
@@ -683,7 +847,10 @@ void *message_thread(void *arg)
 		worker_threads_mem[i].tid = tid;
 	}
 
-	run_msg_thread(td);
+	if (requests_per_sec)
+		run_rps_thread(worker_threads_mem);
+	else
+		run_msg_thread(td);
 
 	for (i = 0; i < worker_threads; i++) {
 		fpost(&worker_threads_mem[i].futex);
@@ -693,7 +860,8 @@ void *message_thread(void *arg)
 	}
 	free(worker_threads_mem);
 
-	td->loops_per_sec /= worker_threads;
+	if (!requests_per_sec)
+		td->loops_per_sec /= worker_threads;
 	return NULL;
 }
 
@@ -742,10 +910,21 @@ int main(int ac, char **av)
 	int ret;
 	struct thread_data *message_threads_mem = NULL;
 	struct stats stats;
-	double loops_per_sec = 0;
+	double loops_per_sec;
+	double avg_requests_per_sec;
 
 	parse_options(ac, av);
+	if (autobench && requests_per_sec == 1) {
+		unsigned long per_thread = 1000000 / (cputime + cputime / 4);
+		requests_per_sec = per_thread * worker_threads * message_threads;
+		requests_per_sec = (requests_per_sec * 75) / 100;
+		fprintf(stderr, "autobench rps %d\n", requests_per_sec);
+	}
+
 again:
+	requests_per_sec /= message_threads;
+	loops_per_sec = 0;
+	avg_requests_per_sec = 0;
 	stopping = 0;
 	memset(&stats, 0, sizeof(stats));
 
@@ -777,7 +956,9 @@ again:
 		pthread_join(message_threads_mem[i].tid, NULL);
 		combine_stats(&stats, &message_threads_mem[i].stats);
 		loops_per_sec += message_threads_mem[i].loops_per_sec;
+		avg_requests_per_sec += message_threads_mem[i].loops_per_sec;
 	}
+	loops_per_sec /= message_threads;
 
 	free(message_threads_mem);
 
@@ -785,26 +966,59 @@ again:
 	 * in auto bench mode, keep adding workers until our latencies get
 	 * horrible
 	 */
-	if (autobench) {
+	if (autobench && requests_per_sec) {
 		int p99 = calc_p99(&stats);
-		fprintf(stderr, "cputime %Lu threads %d p99 %d\n",
+		double diff = (double)p99 / cputime;
+		if (diff < 5) {
+			int bump;
+
+			requests_per_sec *= message_threads;
+
+			if (diff > 0.50)
+				bump = requests_per_sec / 70;
+			else if (diff > 0.45)
+				bump = requests_per_sec / 60;
+			else if (diff > 0.40)
+				bump = requests_per_sec / 50;
+			else if (diff > 0.30)
+				bump = requests_per_sec / 40;
+			else
+				bump = requests_per_sec / 30;
+
+			bump = ((bump + 4) / 5) * 5;
+
+			fprintf(stdout, "rps: %.2f p99/cputime %.2f%%\n",
+				avg_requests_per_sec, diff * 100);
+			requests_per_sec += bump;
+			goto again;
+		}
+
+	} else if (autobench) {
+		int p99 = calc_p99(&stats);
+		fprintf(stdout, "cputime %Lu threads %d p99 %d\n",
 			cputime, worker_threads, p99);
 		if (p99 < 2000) {
 			worker_threads++;
 			goto again;
 		}
+		show_latencies(&stats);
+	} else {
+		show_latencies(&stats);
 	}
 
-	show_latencies(&stats);
 	if (pipe_test) {
 		char *pretty;
 		double mb_per_sec;
-		loops_per_sec /= message_threads;
 		mb_per_sec = loops_per_sec * pipe_test;
 		mb_per_sec = pretty_size(mb_per_sec, &pretty);
 		printf("avg worker transfer: %.2f ops/sec %.2f%s/s\n",
 		       loops_per_sec, mb_per_sec, pretty);
 
+	}
+	if (requests_per_sec) {
+		int p99 = calc_p99(&stats);
+		double diff = (double)p99 / cputime;
+		printf("avg rps: %.2f p99/cputime %.2f%%\n", avg_requests_per_sec, diff * 100);
 	}
 
 	return 0;
