@@ -66,6 +66,7 @@ struct stats {
 
 /* this defines which latency profiles get printed */
 #define PLIST_P99 4
+#define PLIST_P95 3
 static double plist[PLAT_LIST_MAX] = { 50.0, 75.0, 90.0, 95.0, 99.0, 99.5, 99.9 };
 
 enum {
@@ -314,18 +315,18 @@ static unsigned int calc_percentiles(unsigned int *io_u_plat, unsigned long nr,
 	return len;
 }
 
-static int calc_p99(struct stats *s)
+static void calc_p99(struct stats *s, int *p95, int *p99)
 {
 	unsigned int *ovals = NULL;
-	int ret = 0;
 	int len;
 
 	len = calc_percentiles(s->plat, s->nr_samples, &ovals);
 	if (len && len > PLIST_P99)
-		ret = ovals[PLIST_P99];
+		*p99 = ovals[PLIST_P99];
+	if (len && len > PLIST_P99)
+		*p95 = ovals[PLIST_P95];
 	if (ovals)
 		free(ovals);
-	return ret;
 }
 
 static void show_latencies(struct stats *s)
@@ -912,6 +913,9 @@ int main(int ac, char **av)
 	struct stats stats;
 	double loops_per_sec;
 	double avg_requests_per_sec;
+	int p99 = 0;
+	int p95 = 0;
+	double diff;
 
 	parse_options(ac, av);
 	if (autobench && requests_per_sec == 1) {
@@ -961,14 +965,14 @@ again:
 	loops_per_sec /= message_threads;
 
 	free(message_threads_mem);
+	calc_p99(&stats, &p95, &p99);
 
 	/*
 	 * in auto bench mode, keep adding workers until our latencies get
 	 * horrible
 	 */
 	if (autobench && requests_per_sec) {
-		int p99 = calc_p99(&stats);
-		double diff = (double)p99 / cputime;
+		diff = (double)p99 / cputime;
 		if (diff < 5) {
 			int bump;
 
@@ -987,14 +991,14 @@ again:
 
 			bump = ((bump + 4) / 5) * 5;
 
-			fprintf(stdout, "rps: %.2f p99/cputime %.2f%%\n",
-				avg_requests_per_sec, diff * 100);
+			fprintf(stdout, "rps: %.2f p95 (usec) %d p99 (usec) %d p95/cputime %.2f%% p99/cputime %.2f%%\n",
+				avg_requests_per_sec, p95, p99, ((double)p95 / cputime) * 100,
+				diff * 100);
 			requests_per_sec += bump;
 			goto again;
 		}
 
 	} else if (autobench) {
-		int p99 = calc_p99(&stats);
 		fprintf(stdout, "cputime %Lu threads %d p99 %d\n",
 			cputime, worker_threads, p99);
 		if (p99 < 2000) {
@@ -1016,9 +1020,10 @@ again:
 
 	}
 	if (requests_per_sec) {
-		int p99 = calc_p99(&stats);
-		double diff = (double)p99 / cputime;
-		printf("avg rps: %.2f p99/cputime %.2f%%\n", avg_requests_per_sec, diff * 100);
+		diff = (double)p99 / cputime;
+		fprintf(stdout, "rps: %.2f p95 (usec) %d p99 (usec) %d p95/cputime %.2f%% p99/cputime %.2f%%\n",
+				avg_requests_per_sec, p95, p99, ((double)p95 / cputime) * 100,
+				diff * 100);
 	}
 
 	return 0;
