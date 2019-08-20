@@ -744,7 +744,14 @@ static void run_rps_thread(struct thread_data *worker_threads_mem)
 	}
 }
 
+#if defined(__x86_64__) || defined(__i386__)
 #define nop __asm__ __volatile__("rep;nop": : :"memory")
+#elif defined(__aarch64__)
+#define nop __asm__ __volatile__("yield" ::: "memory")
+#else
+#error Unsupported architecture
+#endif
+
 static void usec_spin(unsigned long spin_time)
 {
 	struct timeval now;
