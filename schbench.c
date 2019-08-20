@@ -338,7 +338,7 @@ static void show_latencies(struct stats *s)
 	if (len) {
 		fprintf(stderr, "Latency percentiles (usec)\n");
 		for (i = 0; i < len; i++)
-			fprintf(stderr, "\t%s%2.4fth: %u\n",
+			fprintf(stderr, "\t%s%2.1fth: %u\n",
 				i == PLIST_P99 ? "*" : "",
 				plist[i], ovals[i]);
 	}
