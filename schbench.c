@@ -705,7 +705,6 @@ static void run_rps_thread(struct thread_data *worker_threads_mem)
 	unsigned long sleep_time;
 	/* total number of times we kicked a worker */
 	unsigned long total_wakes = 0;
-	int left;
 	int cur_tid = 0;
 	int i;
 
@@ -719,17 +718,15 @@ static void run_rps_thread(struct thread_data *worker_threads_mem)
 		usleep(sleep_time);
 
 		gettimeofday(&start, NULL);
-		left = nr_to_wake;
 
 		for (i = 0; i < nr_to_wake; i++) {
 			struct thread_data *worker;
-			struct request *old;
 
 			worker = worker_threads_mem + cur_tid % worker_threads;
 			cur_tid++;
 
 			request = allocate_request();
-			old = request_add(worker, request);
+			request_add(worker, request);
 			total_wakes++;
 			memcpy(&worker->wake_time, &start, sizeof(start));
 			fpost(&worker->futex);
