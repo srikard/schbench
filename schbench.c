@@ -745,6 +745,8 @@ static void run_rps_thread(struct thread_data *worker_threads_mem)
 #define nop __asm__ __volatile__("rep;nop": : :"memory")
 #elif defined(__aarch64__)
 #define nop __asm__ __volatile__("yield" ::: "memory")
+#elif defined(__powerpc64__)
+#define nop __asm__ __volatile__("nop": : :"memory")
 #else
 #error Unsupported architecture
 #endif
